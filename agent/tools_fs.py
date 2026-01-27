@@ -1,177 +1,264 @@
+# agent/tools_fs.py
 from __future__ import annotations
+
+import os
+import shutil
 from pathlib import Path
-import re
+from typing import Any, Dict, Optional
 
-from .config import MAX_WRITE_BYTES, MAX_PATCH_BYTES, MAX_APPEND_BYTES
-from .paths import ensure_under_safe_roots, ensure_text_safe
+from .state import get_current_workdir
+from .paths import ensure_under_safe_roots
+from .recovery import make_backup_for_file, record_last, BackupEntry
 
-def list_dir(path: str):
-    p = ensure_under_safe_roots(path)
-    if p.is_file():
-        return {"error": "path is a file", "path": str(p)}
-    if not p.exists():
-        return {"error": "path not found", "path": str(p)}
 
+# -------------------------
+# path helpers
+# -------------------------
+def _abs_path(path: str) -> Path:
+    cwd = get_current_workdir()
+    if cwd is None:
+        raise PermissionError("no current project. run set_project first")
+
+    p = Path(path)
+    if not p.is_absolute():
+        p = (cwd / p).resolve()
+
+    ensure_under_safe_roots(p)  # SAFE_ROOTS 밖 접근 방지
+    return p
+
+
+def _read_text_safe(p: Path) -> str:
+    if not p.exists() or not p.is_file():
+        return ""
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def _write_text_safe(p: Path, content: str) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+
+
+# -------------------------
+# list/read tools
+# -------------------------
+def list_dir(path: str = ".") -> Dict[str, Any]:
+    p = _abs_path(path)
+    if not p.exists() or not p.is_dir():
+        return {"error": "not_a_dir", "path": str(p)}
     items = []
-    for child in sorted(p.iterdir()):
-        try:
-            size = child.stat().st_size
-        except Exception:
-            size = None
+    for child in sorted(p.iterdir(), key=lambda x: x.name.lower()):
         items.append({
             "name": child.name,
             "type": "dir" if child.is_dir() else "file",
-            "size": size
+            "size": child.stat().st_size if child.exists() else 0,
         })
-    return {"path": str(p), "items": items[:200]}
+    return {"path": str(p), "items": items}
 
-def read_tail(path: str, lines: int = 200):
-    p = ensure_under_safe_roots(path)
-    ensure_text_safe(p)
+
+def read_tail(path: str, lines: int = 200) -> Dict[str, Any]:
+    p = _abs_path(path)
     if not p.exists() or not p.is_file():
         return {"error": "file not found", "path": str(p)}
+    txt = _read_text_safe(p)
+    arr = txt.splitlines()
+    tail = arr[-max(1, int(lines)):]
+    return {"path": str(p), "lines": len(tail), "content": "\n".join(tail)}
 
-    lines = max(1, min(int(lines), 500))
-    try:
-        with p.open("r", encoding="utf-8", errors="replace") as f:
-            data = f.readlines()
-        tail = data[-lines:]
-        return {"path": str(p), "lines": lines, "content": "".join(tail)}
-    except Exception as e:
-        return {"error": str(e), "path": str(p)}
 
-def mkdir(path: str, parents: bool = True):
-    p = ensure_under_safe_roots(path)
-    if p.exists() and p.is_file():
-        return {"error": "path exists as file", "path": str(p)}
+# -------------------------
+# preview helpers (Step D)
+# -------------------------
+def preview_write_file(path: str, content: str, overwrite: bool = True) -> Dict[str, Any]:
+    p = _abs_path(path)
+    before = _read_text_safe(p)
+    if p.exists() and (not overwrite):
+        return {"error": "file_exists", "path": str(p)}
+    after = content
+    return {"kind": "write", "path": str(p), "before": before, "after": after}
+
+
+def preview_append_file(path: str, content: str) -> Dict[str, Any]:
+    p = _abs_path(path)
+    before = _read_text_safe(p)
+    after = before + content
+    return {"kind": "append", "path": str(p), "before": before, "after": after}
+
+
+def preview_patch_file(
+    path: str,
+    op: str,
+    content: str,
+    anchor: Optional[str] = None,
+    start_marker: Optional[str] = None,
+    end_marker: Optional[str] = None,
+    occurrence: int = 1,
+) -> Dict[str, Any]:
+    p = _abs_path(path)
+    before = _read_text_safe(p)
+
+    # patch 로직은 실제 patch_file과 동일해야 함
+    # (간단 구현: 최소한 replace_all/replace_between/insert_*만 지원)
+    txt = before
+
+    if op == "replace_all":
+        after = content
+
+    elif op in ("insert_after", "insert_before"):
+        if not anchor:
+            return {"error": "anchor_required", "path": str(p)}
+        idx = -1
+        start = 0
+        for _ in range(max(1, int(occurrence))):
+            idx = txt.find(anchor, start)
+            if idx < 0:
+                break
+            start = idx + len(anchor)
+        if idx < 0:
+            return {"error": "anchor_not_found", "path": str(p), "anchor": anchor}
+        if op == "insert_after":
+            pos = idx + len(anchor)
+        else:
+            pos = idx
+        after = txt[:pos] + content + txt[pos:]
+
+    elif op == "replace_between":
+        if not (start_marker and end_marker):
+            return {"error": "markers_required", "path": str(p)}
+        a = txt.find(start_marker)
+        if a < 0:
+            return {"error": "start_marker_not_found", "path": str(p)}
+        b = txt.find(end_marker, a + len(start_marker))
+        if b < 0:
+            return {"error": "end_marker_not_found", "path": str(p)}
+        after = txt[: a + len(start_marker)] + content + txt[b:]
+
+    else:
+        return {"error": "unsupported_patch_op", "op": op, "path": str(p)}
+
+    return {"kind": "patch", "path": str(p), "before": before, "after": after}
+
+
+def preview_rename_path(src: str, dst: Optional[str] = None, new_name: Optional[str] = None) -> Dict[str, Any]:
+    s = _abs_path(src)
+    if not s.exists():
+        return {"error": "src_not_found", "src": str(s)}
+
+    if dst:
+        d = _abs_path(dst)
+    elif new_name:
+        d = s.with_name(new_name)
+        ensure_under_safe_roots(d)
+    else:
+        return {"error": "dst_or_new_name_required"}
+
+    return {"kind": "rename", "src": str(s), "dst": str(d)}
+
+
+def preview_mkdir(path: str, parents: bool = True) -> Dict[str, Any]:
+    p = _abs_path(path)
+    if p.exists():
+        return {"kind": "mkdir", "path": str(p), "note": "already exists"}
+    return {"kind": "mkdir", "path": str(p), "note": "will create"}
+
+
+# -------------------------
+# mutating tools (Step E: backup)
+# -------------------------
+def mkdir(path: str, parents: bool = True) -> Dict[str, Any]:
+    p = _abs_path(path)
+    if p.exists():
+        return {"ok": True, "path": str(p), "note": "already exists"}
     p.mkdir(parents=bool(parents), exist_ok=True)
     return {"ok": True, "path": str(p)}
 
-def write_file(path: str, content: str, overwrite: bool = True):
-    p = ensure_under_safe_roots(path)
-    ensure_text_safe(p)
 
-    if p.exists() and p.is_dir():
-        return {"error": "path is a directory", "path": str(p)}
+def write_file(path: str, content: str, overwrite: bool = True) -> Dict[str, Any]:
+    p = _abs_path(path)
 
-    data = (content or "").encode("utf-8", errors="replace")
-    if len(data) > MAX_WRITE_BYTES:
-        return {"error": "content too large", "max_bytes": MAX_WRITE_BYTES, "size": len(data)}
+    backups: list[BackupEntry] = []
+    be = make_backup_for_file(p)  # 존재하면 백업
+    if be:
+        backups.append(be)
 
-    if p.exists() and not overwrite:
-        return {"error": "file exists and overwrite=false", "path": str(p)}
+    if p.exists() and (not overwrite):
+        return {"error": "file exists", "path": str(p)}
 
-    p.parent.mkdir(parents=True, exist_ok=True)
-    existed_before = p.exists()
-    with p.open("w", encoding="utf-8", errors="replace") as f:
-        f.write(content or "")
+    _write_text_safe(p, content)
 
-    return {"ok": True, "path": str(p), "bytes": len(data), "overwritten": existed_before}
+    # ✅ Step E: 마지막 백업 기록
+    record_last(backups)
 
-def append_file(path: str, content: str):
-    p = ensure_under_safe_roots(path)
-    ensure_text_safe(p)
+    return {"ok": True, "path": str(p), "backup_count": len(backups)}
 
-    data = (content or "").encode("utf-8", errors="replace")
-    if len(data) > MAX_APPEND_BYTES:
-        return {"error": "content too large", "max_bytes": MAX_APPEND_BYTES, "size": len(data)}
 
-    p.parent.mkdir(parents=True, exist_ok=True)
-    existed_before = p.exists()
+def append_file(path: str, content: str) -> Dict[str, Any]:
+    p = _abs_path(path)
 
-    with p.open("a", encoding="utf-8", errors="replace") as f:
-        f.write(content or "")
+    backups: list[BackupEntry] = []
+    be = make_backup_for_file(p)
+    if be:
+        backups.append(be)
 
-    return {"ok": True, "path": str(p), "bytes": len(data), "created": (not existed_before)}
+    before = _read_text_safe(p)
+    after = before + content
+    _write_text_safe(p, after)
+
+    record_last(backups)
+    return {"ok": True, "path": str(p), "backup_count": len(backups)}
+
 
 def patch_file(
     path: str,
     op: str,
     content: str,
-    anchor: str | None = None,
-    start_marker: str | None = None,
-    end_marker: str | None = None,
-    occurrence: int = 1
-):
-    p = ensure_under_safe_roots(path)
-    ensure_text_safe(p)
+    anchor: Optional[str] = None,
+    start_marker: Optional[str] = None,
+    end_marker: Optional[str] = None,
+    occurrence: int = 1,
+) -> Dict[str, Any]:
+    prev = preview_patch_file(
+        path=path,
+        op=op,
+        content=content,
+        anchor=anchor,
+        start_marker=start_marker,
+        end_marker=end_marker,
+        occurrence=occurrence,
+    )
+    if prev.get("error"):
+        return prev
 
-    if not p.exists() or not p.is_file():
-        return {"error": "file not found", "path": str(p)}
+    p = Path(prev["path"])
+    before = prev["before"]
+    after = prev["after"]
 
-    size = p.stat().st_size
-    if size > MAX_PATCH_BYTES:
-        return {"error": "file too large to patch safely", "max_bytes": MAX_PATCH_BYTES, "size": size}
+    backups: list[BackupEntry] = []
+    be = make_backup_for_file(p)
+    if be:
+        backups.append(be)
 
-    text = p.read_text(encoding="utf-8", errors="replace")
-    occurrence = max(1, int(occurrence))
+    _write_text_safe(p, after)
 
-    def find_nth(haystack: str, needle: str, n: int) -> int:
-        idx = -1
-        start = 0
-        for _ in range(n):
-            idx = haystack.find(needle, start)
-            if idx == -1:
-                return -1
-            start = idx + len(needle)
-        return idx
+    record_last(backups)
+    return {"ok": True, "path": str(p), "backup_count": len(backups)}
 
-    if op in ("insert_after", "insert_before"):
-        if not anchor:
-            return {"error": "anchor required for insert ops"}
-        pos = find_nth(text, anchor, occurrence)
-        if pos == -1:
-            return {"error": "anchor not found", "anchor": anchor, "occurrence": occurrence}
 
-        insert_at = pos + len(anchor) if op == "insert_after" else pos
-        new_text = text[:insert_at] + (content or "") + text[insert_at:]
+def rename_path(src: str, dst: Optional[str] = None, new_name: Optional[str] = None) -> Dict[str, Any]:
+    prev = preview_rename_path(src=src, dst=dst, new_name=new_name)
+    if prev.get("error"):
+        return prev
 
-    elif op == "replace_between":
-        if not start_marker or not end_marker:
-            return {"error": "start_marker and end_marker required"}
-        s = find_nth(text, start_marker, occurrence)
-        if s == -1:
-            return {"error": "start_marker not found", "start_marker": start_marker, "occurrence": occurrence}
-        e = text.find(end_marker, s + len(start_marker))
-        if e == -1:
-            return {"error": "end_marker not found", "end_marker": end_marker}
+    s = Path(prev["src"])
+    d = Path(prev["dst"])
 
-        inner_start = s + len(start_marker)
-        inner_end = e
-        new_text = text[:inner_start] + (content or "") + text[inner_end:]
+    backups: list[BackupEntry] = []
+    # ✅ rename은 “원본 파일”을 백업(복구는 원래 경로로 되살리는 방식)
+    be = make_backup_for_file(s)
+    if be:
+        backups.append(be)
 
-    elif op == "replace_all":
-        if not anchor:
-            return {"error": "anchor required for replace_all (needle)"}
-        new_text = text.replace(anchor, content or "")
+    d.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(s), str(d))
 
-    else:
-        return {"error": "unknown op", "op": op}
-
-    out_bytes = new_text.encode("utf-8", errors="replace")
-    if len(out_bytes) > MAX_WRITE_BYTES:
-        return {"error": "patched content too large", "max_bytes": MAX_WRITE_BYTES, "size": len(out_bytes)}
-
-    p.write_text(new_text, encoding="utf-8", errors="replace")
-    return {"ok": True, "path": str(p), "op": op, "bytes": len(out_bytes)}
-
-def rename_path(src: str, dst: str | None = None, new_name: str | None = None):
-    src_p = ensure_under_safe_roots(src)
-    if not src_p.exists():
-        return {"error": "source not found", "src": str(src_p)}
-
-    if new_name and dst:
-        return {"error": "provide only one of dst or new_name"}
-
-    if new_name:
-        dst_p = src_p.parent / new_name
-    else:
-        if not dst:
-            return {"error": "dst or new_name required"}
-        dst_p = ensure_under_safe_roots(dst)
-
-    if dst_p.exists():
-        return {"error": "destination already exists", "dst": str(dst_p)}
-
-    src_p.rename(dst_p)
-    return {"ok": True, "src": str(src_p), "dst": str(dst_p)}
+    record_last(backups)
+    return {"ok": True, "src": str(s), "dst": str(d), "backup_count": len(backups)}

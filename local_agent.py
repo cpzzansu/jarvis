@@ -1,3 +1,4 @@
+# local_agent.py
 import json
 import requests
 
@@ -5,20 +6,68 @@ from agent.config import OLLAMA_URL, MODEL, SAFE_ROOTS, GIT_WRITE_KEYS
 from agent.prompt import build_system_prompt
 from agent.plan import parse_json_object, normalize_to_plan, optimize_plan
 from agent.state import state_line, set_current_workdir, get_current_workdir
-from agent.paths import ensure_under_safe_roots
 from agent.project_resolver import resolve_project_dir
 
 from agent.tools_fs import (
     list_dir, read_tail, mkdir, write_file, append_file, patch_file, rename_path
 )
 from agent.tools_cmd import run_whitelisted_cmd, resolve_git_cwd
-from agent.approval import print_git_preview, prompt_yes_no
 from agent.fallback import maybe_fallback_for_patch
+from agent.lang_guard import is_language_ok, build_rewrite_request
+from agent.approval import apply_git_approval_layer, print_git_preview, prompt_yes_no
+
+from agent.rag import build_or_update_index, retrieve, format_hits_for_prompt
+
+# Step D
+from agent.approval_fs import FS_WRITE_ACTIONS, approve_fs_action
+
+# Step E
+from agent.recovery import undo_last
 
 
-# =========================
-# LLM
-# =========================
+def normalize_git_direct_actions(actions: list[dict]) -> list[dict]:
+    mapping = {
+        "git_status": ("git_status", []),
+        "git_diff": ("git_diff", []),
+        "git_diff_staged": ("git_diff_staged", []),
+        "git_add": ("git_add", None),
+        "git_commit": ("git_commit", None),
+        "git_push": ("git_push", None),
+    }
+
+    out = []
+    for step in actions:
+        act = step.get("action")
+        if act not in mapping:
+            out.append(step)
+            continue
+
+        cmd_key, fixed_args = mapping[act]
+        params = step.get("params", {}) or {}
+
+        if fixed_args is not None:
+            args = fixed_args[:]
+        else:
+            if act == "git_add":
+                path = params.get("path") or params.get("file") or "."
+                args = [str(path)]
+            elif act == "git_commit":
+                msg = params.get("message") or params.get("msg") or ""
+                args = [str(msg)] if msg.strip() else ["update"]
+            elif act == "git_push":
+                remote = params.get("remote")
+                branch = params.get("branch")
+                if remote and branch:
+                    args = [str(remote), str(branch)]
+                elif remote:
+                    args = [str(remote)]
+                else:
+                    args = []
+        out.append({"action": "run_cmd", "params": {"cmd_key": cmd_key, "args": args}})
+
+    return out
+
+
 def ollama_chat(messages):
     payload = {
         "model": MODEL,
@@ -31,9 +80,6 @@ def ollama_chat(messages):
     return r.json()["message"]["content"]
 
 
-# =========================
-# set_project tool (✅ fuzzy resolver 적용)
-# =========================
 def tool_set_project(workdir: str):
     p, info = resolve_project_dir(workdir)
     if p is None:
@@ -48,12 +94,18 @@ def tool_set_project(workdir: str):
     return {"ok": True, "current_workdir": str(p), **info}
 
 
-# =========================
-# executor
-# =========================
 def execute_one_action(action: str, params: dict):
     if action == "set_project":
         return tool_set_project(params.get("workdir", ""))
+
+    if action == "index_project":
+        wd = params.get("workdir") or get_current_workdir()
+        if not wd:
+            return {"error": "no current workdir. use set_project first"}
+        return build_or_update_index(wd)
+
+    if action == "undo_last":
+        return undo_last()
 
     if action == "list_dir":
         return list_dir(params.get("path", "."))
@@ -94,20 +146,16 @@ def execute_one_action(action: str, params: dict):
     return {"error": f"unknown action: {action}"}
 
 
-# =========================
-# Main loop
-# =========================
 def main():
     print("SAFE_ROOTS:")
     for r in SAFE_ROOTS:
         print(" -", r)
 
     print("\nExamples:")
-    print(" - 'suppoter_hub 프로젝트로 설정해줘'")
+    print(" - 'jarvis 프로젝트로 설정해줘'")
     print(" - 'TASKS.md 맨 아래에 진행상태 5줄 추가해줘'")
-    print(" - 'test_projec 폴더 이름 test_project로 바꿔줘'")
-    print(" - 'git status 보여줘'")
-    print(" - '변경사항 stage 하고 커밋해줘: 메시지=...'\n")
+    print(" - '되돌리기 해줘' (undo_last)")
+    print(" - 'git status 보여줘'\n")
 
     SYSTEM_PROMPT = build_system_prompt()
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -117,8 +165,19 @@ def main():
         if not user:
             continue
 
-        # ✅ STATE 주입(매 턴 최신 cwd를 LLM이 보게 함)
         messages.append({"role": "system", "content": state_line()})
+
+        cwd = get_current_workdir()
+        if cwd:
+            try:
+                hits = retrieve(cwd, user, top_k=8)
+                ctx = format_hits_for_prompt(hits, cwd)
+                messages.append({
+                    "role": "user",
+                    "content": "아래는 현재 프로젝트 코드베이스에서 검색한 컨텍스트입니다. 이 근거를 사용해서만 판단하세요.\n\n" + ctx
+                })
+            except Exception as e:
+                messages.append({"role": "user", "content": f"(RAG 컨텍스트 주입 실패: {e})"})
 
         messages.append({"role": "user", "content": user})
         raw = ollama_chat(messages)
@@ -129,6 +188,16 @@ def main():
             print("Agent> (LLM JSON parse failed)\n", raw, "\n")
             continue
 
+        ok, _detail = is_language_ok(cmd, forbid_latin=False)
+        if not ok:
+            messages.append({"role": "user", "content": build_rewrite_request(forbid_latin=False)})
+            raw_retry = ollama_chat(messages)
+            try:
+                cmd = parse_json_object(raw_retry)
+            except Exception:
+                print("Agent> (LLM JSON parse failed after rewrite)\n", raw_retry, "\n")
+                continue
+
         cmd = normalize_to_plan(cmd)
         cmd = optimize_plan(cmd)
 
@@ -137,7 +206,7 @@ def main():
             continue
 
         if cmd.get("action") != "plan":
-            print("Agent> (invalid schema: expected action=plan or final)\n", json.dumps(cmd, ensure_ascii=False, indent=2), "\n")
+            print("Agent> (invalid schema)\n", json.dumps(cmd, ensure_ascii=False, indent=2), "\n")
             continue
 
         actions = cmd.get("actions", [])
@@ -146,18 +215,48 @@ def main():
             print("Agent> (plan has no actions)\n", json.dumps(cmd, ensure_ascii=False, indent=2), "\n")
             continue
 
+        actions = normalize_git_direct_actions(actions)
+
         print(f"\n[LLM plan] reason={reason} steps={len(actions)}")
 
-        results = []
-        aborted = False
+        # Step B: Git 승인 레이어
+        try:
+            _, actions = apply_git_approval_layer(actions)
+        except Exception as e:
+            print(f"Agent> (approval layer error) {e}")
+            safe_actions = []
+            for step in actions:
+                if step.get("action") == "run_cmd":
+                    params = step.get("params", {}) or {}
+                    if params.get("cmd_key") in {"git_add", "git_commit", "git_push"}:
+                        continue
+                safe_actions.append(step)
+            actions = safe_actions
 
+        print(f"\n[LLM plan after approval] steps={len(actions)}")
+
+        results = []
         for i, step in enumerate(actions, start=1):
             step_action = step.get("action")
             step_params = step.get("params", {}) or {}
 
             print(f"\n[Step {i}/{len(actions)}] action={step_action} params={step_params}")
 
-            # ✅ Step B: git write(add/commit/push)는 실행 전 승인 받기
+            # Step D: 파일 적용 승인
+            if step_action in FS_WRITE_ACTIONS:
+                ok_apply, preview_or_err = approve_fs_action(step_action, step_params)
+                if not ok_apply:
+                    result = {
+                        "skipped": True,
+                        "reason": "user denied file apply or preview failed",
+                        "detail": preview_or_err,
+                        "action": step_action,
+                    }
+                    print("[Tool result]\n", json.dumps(result, ensure_ascii=False, indent=2))
+                    results.append({"step": i, "action": step_action, "params": step_params, "result": result})
+                    continue
+
+            # Step B: git write 승인
             if step_action == "run_cmd":
                 cmd_key = (step_params or {}).get("cmd_key", "")
                 if cmd_key in GIT_WRITE_KEYS:
@@ -166,58 +265,36 @@ def main():
                     if err is None and git_cwd is not None:
                         print("\n=== APPROVAL REQUIRED (git write) ===")
                         preview = print_git_preview(git_cwd)
-
                         has_any_change = (
                             (preview.get("status") or "").strip() != "" or
                             (preview.get("diff") or "").strip() != "" or
                             (preview.get("diff_staged") or "").strip() != ""
                         )
-                        if has_any_change:
-                            ok = prompt_yes_no("이 변경을 계속 진행할까요? (y/n): ")
-                            if not ok:
-                                result = {
-                                    "skipped": True,
-                                    "reason": "user denied approval for git write",
-                                    "cmd_key": cmd_key,
-                                    "cwd": str(git_cwd),
-                                }
-                                print("[Tool result]\n", json.dumps(result, ensure_ascii=False, indent=2))
-                                results.append({"step": i, "action": step_action, "params": step_params, "result": result})
-                                continue
-                        else:
-                            print("변경사항이 없어서 승인 없이 진행합니다.")
+                        if has_any_change and (not prompt_yes_no("이 변경을 계속 진행할까요? (y/n): ")):
+                            result = {"skipped": True, "reason": "user denied approval for git write", "cmd_key": cmd_key}
+                            print("[Tool result]\n", json.dumps(result, ensure_ascii=False, indent=2))
+                            results.append({"step": i, "action": step_action, "params": step_params, "result": result})
+                            continue
 
             try:
                 result = execute_one_action(step_action, step_params)
-            except PermissionError as e:
-                result = {"error": "permission_denied", "detail": str(e)}
             except Exception as e:
                 result = {"error": "tool_exception", "detail": str(e)}
 
             print("[Tool result]\n", json.dumps(result, ensure_ascii=False, indent=2))
-
-            # ✅ 핵심: set_project 실패하면 남은 step 즉시 중단 (연쇄 실패 방지)
-            if step_action == "set_project" and isinstance(result, dict) and result.get("error"):
-                results.append({"step": i, "action": step_action, "params": step_params, "result": result})
-                print("\n[Abort] set_project failed. Stop remaining steps in this plan.\n")
-                aborted = True
-                break
+            results.append({"step": i, "action": step_action, "params": step_params, "result": result})
 
             fb = maybe_fallback_for_patch(step_action, step_params, result, user_request=user)
             if fb is not None:
                 print("\n[Fallback triggered]\n", json.dumps(fb, ensure_ascii=False, indent=2))
-                results.append({"step": i, "action": step_action, "params": step_params, "result": result, "fallback": fb})
-            else:
-                results.append({"step": i, "action": step_action, "params": step_params, "result": result})
+                results[-1]["fallback"] = fb
 
-        # aborted여도 결과는 LLM에게 전달해서 요약/다음 액션 정리 유도
         messages.append({"role": "user", "content": f"TOOL_RESULTS (json): {json.dumps(results, ensure_ascii=False)}"})
         raw2 = ollama_chat(messages)
 
         try:
             cmd2 = parse_json_object(raw2)
             cmd2 = normalize_to_plan(cmd2)
-
             if cmd2.get("action") == "final":
                 print(f"\nAgent> {cmd2.get('final_answer','')}\n")
             elif cmd2.get("action") == "plan":

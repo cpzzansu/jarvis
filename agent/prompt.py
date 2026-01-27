@@ -1,4 +1,6 @@
+# agent/prompt.py
 from __future__ import annotations
+
 from .config import SAFE_ROOTS
 
 def build_system_prompt() -> str:
@@ -17,6 +19,9 @@ Available step actions:
 - set_project: set current project workdir (must be under SAFE_ROOTS)
   params {{ "workdir": "project_folder_name_or_path" }}
   NOTE: workdir may contain typos; runtime will fuzzy-match.
+
+- index_project: build/update code index (RAG)
+  params {{ "workdir": "optional project folder name or path" }}
 
 - list_dir: params {{ "path": "..." }}
 - read_tail: params {{ "path": "...", "lines": 200 }}
@@ -38,6 +43,10 @@ Available step actions:
 - rename_path:
   params {{ "src": "...", "dst": "..." }} OR {{ "src": "...", "new_name": "..." }}
 
+- undo_last:
+  마지막 백업을 복구(되돌리기)
+  params {{}}  (no params)
+
 - run_cmd: params {{ "cmd_key": "...", "args": [...] }}
   cmd_key options:
     pwd, ls, whoami, date,
@@ -46,11 +55,12 @@ Available step actions:
 
 Rules:
 - Always prefer the smallest/safest actions first.
-- Never request destructive commands (rm, mv, kill, shutdown, reboot, curl|bash etc).
+- Never request destructive commands (rm, kill, shutdown, reboot, curl|bash etc).
 - For rename requests: MUST use rename_path (never mv).
 - For "맨 밑에 추가": prefer append_file (avoid patch anchors).
 - For patch_file insert_*: anchor MUST already exist.
-- For git commit/push: project must be set via set_project (or pass workdir as first arg).
+- For git commit/push: project must be set via set_project.
+- For rollback/undo 요청(되돌리기/복구): use undo_last.
 
 SAFE_ROOTS:
 {roots}
@@ -61,7 +71,7 @@ Output JSON schema (plan):
   "reason": "짧은 사유(가능하면 한국어)",
   "actions": [
     {{
-      "action": "set_project|mkdir|write_file|append_file|patch_file|rename_path|list_dir|read_tail|run_cmd",
+      "action": "set_project|index_project|mkdir|write_file|append_file|patch_file|rename_path|undo_last|list_dir|read_tail|run_cmd",
       "params": {{...}}
     }}
   ]
