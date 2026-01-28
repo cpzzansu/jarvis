@@ -121,7 +121,7 @@ def apply_git_approval_layer(actions: List[Dict[str, Any]]) -> Tuple[bool, List[
 
 
 # (호환용 별칭: 예전 임포트가 남아있어도 ImportError 안 나게)
-def print_git_preview():
+def print_git_preview(*_args, **_kwargs):
     return show_git_preview()
 
 
