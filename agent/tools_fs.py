@@ -2,13 +2,25 @@
 from __future__ import annotations
 
 import os
+import py_compile
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .state import get_current_workdir
 from .paths import ensure_under_safe_roots
 from .recovery import make_backup_for_file, record_last, BackupEntry
+
+
+def _validate_python_syntax(path: Path) -> Tuple[bool, str]:
+    """Python 파일이면 py_compile 검사. (성공, '') 또는 (실패, 에러메시지)."""
+    if path.suffix.lower() != ".py":
+        return True, ""
+    try:
+        py_compile.compile(str(path), doraise=True)
+        return True, ""
+    except py_compile.PyCompileError as e:
+        return False, str(e)
 
 
 # -------------------------
@@ -84,6 +96,18 @@ def preview_append_file(path: str, content: str) -> Dict[str, Any]:
     return {"kind": "append", "path": str(p), "before": before, "after": after}
 
 
+def _normalize_patch_content(content: str, op: str) -> str:
+    """insert_after/insert_before/replace_between 시 content 앞뒤 개행 보장 (붙어서 SyntaxError 방지)."""
+    if op == "replace_all":
+        return content
+    c = content if content is not None else ""
+    if c and not c.startswith("\n"):
+        c = "\n" + c
+    if c and not c.endswith("\n"):
+        c = c + "\n"
+    return c
+
+
 def preview_patch_file(
     path: str,
     op: str,
@@ -95,9 +119,9 @@ def preview_patch_file(
 ) -> Dict[str, Any]:
     p = _abs_path(path)
     before = _read_text_safe(p)
+    content = _normalize_patch_content(content or "", op)
 
     # patch 로직은 실제 patch_file과 동일해야 함
-    # (간단 구현: 최소한 replace_all/replace_between/insert_*만 지원)
     txt = before
 
     if op == "replace_all":
@@ -172,6 +196,23 @@ def mkdir(path: str, parents: bool = True) -> Dict[str, Any]:
     return {"ok": True, "path": str(p)}
 
 
+def _apply_then_validate_py(p: Path, backups: List[BackupEntry]) -> Optional[Dict[str, Any]]:
+    """
+    .py 파일이면 적용 후 py_compile 검증. 실패 시 백업 복원(또는 신규 파일 삭제) 후 에러 반환.
+    반환값이 None이면 검증 통과.
+    """
+    if p.suffix.lower() != ".py":
+        return None
+    ok, err_msg = _validate_python_syntax(p)
+    if ok:
+        return None
+    if backups:
+        shutil.copy2(backups[0].backup, p)
+    else:
+        p.unlink(missing_ok=True)
+    return {"error": "py_compile_failed", "detail": err_msg, "rolled_back": bool(backups), "path": str(p)}
+
+
 def write_file(path: str, content: str, overwrite: bool = True) -> Dict[str, Any]:
     p = _abs_path(path)
 
@@ -185,9 +226,11 @@ def write_file(path: str, content: str, overwrite: bool = True) -> Dict[str, Any
 
     _write_text_safe(p, content)
 
-    # ✅ Step E: 마지막 백업 기록
-    record_last(backups)
+    err = _apply_then_validate_py(p, backups)
+    if err:
+        return err
 
+    record_last(backups)
     return {"ok": True, "path": str(p), "backup_count": len(backups)}
 
 
@@ -202,6 +245,10 @@ def append_file(path: str, content: str) -> Dict[str, Any]:
     before = _read_text_safe(p)
     after = before + content
     _write_text_safe(p, after)
+
+    err = _apply_then_validate_py(p, backups)
+    if err:
+        return err
 
     record_last(backups)
     return {"ok": True, "path": str(p), "backup_count": len(backups)}
@@ -238,6 +285,10 @@ def patch_file(
         backups.append(be)
 
     _write_text_safe(p, after)
+
+    err = _apply_then_validate_py(p, backups)
+    if err:
+        return err
 
     record_last(backups)
     return {"ok": True, "path": str(p), "backup_count": len(backups)}

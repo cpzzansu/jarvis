@@ -1,4 +1,5 @@
 from __future__ import annotations
+import ast
 import json
 from typing import Any
 
@@ -13,7 +14,14 @@ def parse_json_object(text: str) -> dict:
     end = text.rfind("}")
     if start == -1 or end == -1 or end < start:
         raise ValueError("No JSON object found")
-    return json.loads(text[start:end + 1])
+    snippet = text[start : end + 1]
+    try:
+        return json.loads(snippet)
+    except json.JSONDecodeError:
+        try:
+            return ast.literal_eval(snippet)
+        except (ValueError, SyntaxError):
+            raise ValueError("No JSON object found")
 
 def normalize_to_plan(cmd: dict) -> dict:
     if cmd.get("action") == "final":

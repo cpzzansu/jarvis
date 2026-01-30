@@ -1,8 +1,8 @@
 # local_agent.py
 import json
-import requests
+import sys
 
-from agent.config import OLLAMA_URL, MODEL, SAFE_ROOTS, GIT_WRITE_KEYS
+from agent.config import SAFE_ROOTS, GIT_WRITE_KEYS
 from agent.prompt import build_system_prompt
 from agent.plan import parse_json_object, normalize_to_plan, optimize_plan
 from agent.state import state_line, set_current_workdir, get_current_workdir
@@ -12,17 +12,30 @@ from agent.tools_fs import (
     list_dir, read_tail, mkdir, write_file, append_file, patch_file, rename_path
 )
 from agent.tools_cmd import run_whitelisted_cmd, resolve_git_cwd
+from agent.vite import create_vite_app as create_vite_app_impl
 from agent.fallback import maybe_fallback_for_patch
 from agent.lang_guard import is_language_ok, build_rewrite_request
 from agent.approval import apply_git_approval_layer, print_git_preview, prompt_yes_no
 
+# RAG
 from agent.rag import build_or_update_index, retrieve, format_hits_for_prompt
+
+# ✅ LLM (OpenAI / Ollama 전환 가능)
+from agent.llm import chat_json, chat_text, set_llm, get_provider, get_model
+from agent.intent_guard import (
+    detect_readonly_intent,
+    filter_plan_to_readonly,
+    build_readonly_rewrite_request,
+)
 
 # Step D
 from agent.approval_fs import FS_WRITE_ACTIONS, approve_fs_action
 
 # Step E
 from agent.recovery import undo_last
+
+from dotenv import load_dotenv
+load_dotenv()
 
 
 def normalize_git_direct_actions(actions: list[dict]) -> list[dict]:
@@ -68,16 +81,16 @@ def normalize_git_direct_actions(actions: list[dict]) -> list[dict]:
     return out
 
 
-def ollama_chat(messages):
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "stream": False,
-        "options": {"temperature": 0.2},
-    }
-    r = requests.post(OLLAMA_URL, json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()["message"]["content"]
+# def ollama_chat(messages):
+#     payload = {
+#         "model": MODEL,
+#         "messages": messages,
+#         "stream": False,
+#         "options": {"temperature": 0.2},
+#     }
+#     r = requests.post(OLLAMA_URL, json=payload, timeout=120)
+#     r.raise_for_status()
+#     return r.json()["message"]["content"]
 
 
 def tool_set_project(workdir: str):
@@ -102,6 +115,12 @@ def execute_one_action(action: str, params: dict):
         wd = params.get("workdir") or get_current_workdir()
         if not wd:
             return {"error": "no current workdir. use set_project first"}
+        # build_or_update_index는 Path를 기대함
+        if isinstance(wd, str):
+            p, info = resolve_project_dir(wd)
+            if p is None or not p.is_dir():
+                return {"error": "workdir not found or not a directory", **(info or {})}
+            wd = p
         return build_or_update_index(wd)
 
     if action == "undo_last":
@@ -133,6 +152,17 @@ def execute_one_action(action: str, params: dict):
             occurrence=params.get("occurrence", 1),
         )
 
+    if action == "create_vite_app":
+        root = get_current_workdir()
+        if root is None:
+            return {"error": "no current workdir. run set_project first"}
+        return create_vite_app_impl(
+            project_root=root,
+            path=params.get("path", "frontend"),
+            template=params.get("template", "react"),
+            ask_yes_no=prompt_yes_no,
+        )
+
     if action == "rename_path":
         return rename_path(
             src=params.get("src", ""),
@@ -142,6 +172,12 @@ def execute_one_action(action: str, params: dict):
 
     if action == "run_cmd":
         return run_whitelisted_cmd(params.get("cmd_key", ""), params.get("args", []))
+
+    if action == "set_llm":
+        provider = (params.get("provider") or "").strip().lower() or "openai"
+        model = (params.get("model") or "").strip()
+        set_llm(provider, model)
+        return {"ok": True, "provider": get_provider(), "model": get_model()}
 
     return {"error": f"unknown action: {action}"}
 
@@ -160,46 +196,127 @@ def main():
     SYSTEM_PROMPT = build_system_prompt()
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+    # while True:
+    #     user = input("You> ").strip()
+    #     if not user:
+    #         continue
+
+    #     messages.append({"role": "system", "content": state_line()})
+
+    #     cwd = get_current_workdir()
+    #     if cwd:
+    #         try:
+    #             hits = retrieve(cwd, user, top_k=8)
+    #             ctx = format_hits_for_prompt(hits, cwd)
+    #             messages.append({
+    #                 "role": "user",
+    #                 "content": "아래는 현재 프로젝트 코드베이스에서 검색한 컨텍스트입니다. 이 근거를 사용해서만 판단하세요.\n\n" + ctx
+    #             })
+    #         except Exception as e:
+    #             messages.append({"role": "user", "content": f"(RAG 컨텍스트 주입 실패: {e})"})
+
+    #     messages.append({"role": "user", "content": user})
+    #     raw = ollama_chat(messages)
+
+    #     try:
+    #         cmd = parse_json_object(raw)
+    #     except Exception:
+    #         print("Agent> (LLM JSON parse failed)\n", raw, "\n")
+    #         continue
+
+    #     ok, _detail = is_language_ok(cmd, forbid_latin=False)
+    #     if not ok:
+    #         messages.append({"role": "user", "content": build_rewrite_request(forbid_latin=False)})
+    #         raw_retry = ollama_chat(messages)
+    #         try:
+    #             cmd = parse_json_object(raw_retry)
+    #         except Exception:
+    #             print("Agent> (LLM JSON parse failed after rewrite)\n", raw_retry, "\n")
+    #             continue
+
+    #     cmd = normalize_to_plan(cmd)
+    #     cmd = optimize_plan(cmd)
+    # 세션/브릿지 모드(stdin이 파이프)에서는 프롬프트 미출력 → 채팅 UI에 "You>" 안 나오게
+    _input_prompt = "" if not sys.stdin.isatty() else "You> "
     while True:
-        user = input("You> ").strip()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        user = input(_input_prompt).strip()
         if not user:
             continue
-
-        messages.append({"role": "system", "content": state_line()})
-
-        cwd = get_current_workdir()
-        if cwd:
-            try:
-                hits = retrieve(cwd, user, top_k=8)
-                ctx = format_hits_for_prompt(hits, cwd)
-                messages.append({
-                    "role": "user",
-                    "content": "아래는 현재 프로젝트 코드베이스에서 검색한 컨텍스트입니다. 이 근거를 사용해서만 판단하세요.\n\n" + ctx
-                })
-            except Exception as e:
-                messages.append({"role": "user", "content": f"(RAG 컨텍스트 주입 실패: {e})"})
-
-        messages.append({"role": "user", "content": user})
-        raw = ollama_chat(messages)
-
-        try:
-            cmd = parse_json_object(raw)
-        except Exception:
-            print("Agent> (LLM JSON parse failed)\n", raw, "\n")
+        # 세션 모드: 백엔드가 보낸 마커/workdir 라인 처리 (그대로 stdout에 출력해 스트림 종료 신호)
+        if user.startswith("__JARVIS_DONE__"):
+            print(user, flush=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            continue
+        if user.startswith("__JARVIS_WORKDIR__:"):
+            path = user[len("__JARVIS_WORKDIR__:"):].strip()
+            tool_set_project(path)
+            sys.stdout.flush()
+            sys.stderr.flush()
             continue
 
+        # ✅ 1) 매 턴 최신 상태(system) 먼저 주입 (LLM이 CURRENT_WORKDIR 등을 보게)
+        messages.append({"role": "system", "content": state_line() + "\nSTATE: llm=" + get_provider() + "/" + get_model()})
+
+        # ✅ 2) RAG 컨텍스트: 사용자 요청을 맨 앞에 두고, 검색 결과는 참고용으로만 (요청을 압도하지 않도록)
+        cwd = get_current_workdir()
+        user_blob = f"사용자 요청 (반드시 이걸 수행하세요):\n{user}"
+        if cwd:
+            try:
+                hits = retrieve(cwd, user, top_k=6)
+                ctx = format_hits_for_prompt(hits, cwd)
+                if ctx and ctx.strip() != "NO_CONTEXT_FOUND":
+                    user_blob += "\n\n--- 참고용 코드 검색 결과 (요청과 관련될 때만 활용) ---\n" + ctx
+            except Exception:
+                pass
+        messages.append({"role": "user", "content": user_blob})
+
+        # ✅ 4) 여기서 LLM 호출 (딱 1번!)
+        try:
+            cmd = chat_json(messages)
+            # chat_json은 이미 딕셔너리를 반환하므로 parse_json_object 불필요
+            if not isinstance(cmd, dict):
+                print(f"Agent> (LLM returned non-dict: {type(cmd)})\n{cmd}\n")
+                continue
+        except RuntimeError as e:
+            print(f"Agent> (LLM failed to return JSON after retries)\n{str(e)}\n")
+            continue
+        except Exception as e:
+            print(f"Agent> (LLM call error: {type(e).__name__})\n{str(e)}\n")
+            continue
+
+        # ✅ 5) 언어 가드: 중국어(한자) 나오면 즉시 재요청 1회
         ok, _detail = is_language_ok(cmd, forbid_latin=False)
         if not ok:
             messages.append({"role": "user", "content": build_rewrite_request(forbid_latin=False)})
-            raw_retry = ollama_chat(messages)
             try:
-                cmd = parse_json_object(raw_retry)
-            except Exception:
-                print("Agent> (LLM JSON parse failed after rewrite)\n", raw_retry, "\n")
+                cmd = chat_json(messages)
+                if not isinstance(cmd, dict):
+                    print(f"Agent> (LLM returned non-dict after rewrite: {type(cmd)})\n{cmd}\n")
+                    continue
+            except RuntimeError as e:
+                print(f"Agent> (LLM failed after rewrite)\n{str(e)}\n")
+                continue
+            except Exception as e:
+                print(f"Agent> (LLM call error after rewrite: {type(e).__name__})\n{str(e)}\n")
                 continue
 
         cmd = normalize_to_plan(cmd)
         cmd = optimize_plan(cmd)
+        # ✅ set_project가 포함된 플랜이면, 바로 index_project도 이어서 실행되도록 자동 추가
+        # - 사용자가 "프로젝트 설정"을 요청할 때 매번 인덱싱을 따로 말하지 않아도 되게 함
+        # - 단, 이미 index_project가 있으면 중복 추가하지 않음
+        try:
+            actions_preview = cmd.get("actions", []) or []
+            has_set_project = any((s.get("action") == "set_project") for s in actions_preview)
+            has_index_project = any((s.get("action") == "index_project") for s in actions_preview)
+            if has_set_project and not has_index_project:
+                cmd.setdefault("actions", []).append({"action": "index_project", "params": {}})
+        except Exception:
+            pass
+
 
         if cmd.get("action") == "final":
             print(f"Agent> {cmd.get('final_answer','')}\n")
@@ -210,6 +327,35 @@ def main():
             continue
 
         actions = cmd.get("actions", [])
+
+        # =========================
+        # ✅ READ-ONLY GUARD (검색/질문이면 수정/커밋/푸시 금지)
+        # =========================
+        guard = detect_readonly_intent(user)
+
+        if guard.readonly:
+            kept, dropped = filter_plan_to_readonly(actions)
+
+            # 만약 LLM이 수정 계획을 내놔서 거의 다 날아갔다면 -> LLM에게 재작성 1회
+            if len(kept) == 0 and len(dropped) > 0:
+                messages.append({"role": "user", "content": build_readonly_rewrite_request()})
+                try:
+                    cmd_ro = chat_json(messages)
+                    if isinstance(cmd_ro, dict):
+                        cmd_ro = normalize_to_plan(cmd_ro)
+                        cmd_ro = optimize_plan(cmd_ro)
+                        actions = cmd_ro.get("actions", []) or []
+                        actions = normalize_git_direct_actions(actions)
+                        kept, dropped = filter_plan_to_readonly(actions)
+                except Exception:
+                    kept = []
+
+            if len(dropped) > 0:
+                print("\n[READ-ONLY GUARD] 이 요청은 조회/검색으로 판단되어, 아래 액션들을 차단했습니다:")
+                print(json.dumps(dropped, ensure_ascii=False, indent=2))
+
+            actions = kept
+
         reason = cmd.get("reason", "")
         if not isinstance(actions, list) or len(actions) == 0:
             print("Agent> (plan has no actions)\n", json.dumps(cmd, ensure_ascii=False, indent=2), "\n")
@@ -264,12 +410,11 @@ def main():
                     git_cwd, _, err = resolve_git_cwd(args)
                     if err is None and git_cwd is not None:
                         print("\n=== APPROVAL REQUIRED (git write) ===")
-                        preview = print_git_preview(git_cwd)
-                        has_any_change = (
-                            (preview.get("status") or "").strip() != "" or
-                            (preview.get("diff") or "").strip() != "" or
-                            (preview.get("diff_staged") or "").strip() != ""
-                        )
+                        preview = print_git_preview()
+                        st = (preview.get("git_status") or {}).get("output") or (preview.get("git_status") or {}).get("error") or ""
+                        df = (preview.get("git_diff") or {}).get("output") or (preview.get("git_diff") or {}).get("error") or ""
+                        dfs = (preview.get("git_diff_staged") or {}).get("output") or (preview.get("git_diff_staged") or {}).get("error") or ""
+                        has_any_change = st.strip() != "" or df.strip() != "" or dfs.strip() != ""
                         if has_any_change and (not prompt_yes_no("이 변경을 계속 진행할까요? (y/n): ")):
                             result = {"skipped": True, "reason": "user denied approval for git write", "cmd_key": cmd_key}
                             print("[Tool result]\n", json.dumps(result, ensure_ascii=False, indent=2))
@@ -290,7 +435,14 @@ def main():
                 results[-1]["fallback"] = fb
 
         messages.append({"role": "user", "content": f"TOOL_RESULTS (json): {json.dumps(results, ensure_ascii=False)}"})
-        raw2 = ollama_chat(messages)
+        messages.append({"role": "user", "content": (
+            "위 TOOL_RESULTS는 이번 턴에서만 실행된 결과입니다. 반드시 action='final' JSON으로만 답하세요. "
+            "plan을 만들지 말고, 이번 결과만 간단·자연스럽게 1~3문장으로 요약하세요. "
+            "형식(1)성공/실패 2)실패원인 3)다음액션)에 얽매이지 말고, 실패가 없으면 '완료했어 / 다음엔 ~ 해봐' 정도로 짧게."
+        )})
+
+        print("[Agent 응답 생성 중...]", flush=True)
+        raw2 = chat_text(messages)
 
         try:
             cmd2 = parse_json_object(raw2)
@@ -303,6 +455,9 @@ def main():
                 print("\nAgent> (LLM output)\n", raw2, "\n")
         except Exception:
             print("\nAgent> (LLM output)\n", raw2, "\n")
+
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 
 if __name__ == "__main__":

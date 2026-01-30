@@ -1,0 +1,116 @@
+import { useEffect, useMemo, useState } from "react";import { useMemo, useState } from "react";
+import { useAgentStream } from "../hooks/useAgentStream";
+
+type Mode = "disconnected" | "connected";
+
+export default function AgentChat() {export default function AgentChat() {
+  const [mode, setMode] = useState<Mode>("disconnected");
+  const [prompt, setPrompt] = useState<string>("");
+  const { status, output, error, start, stop } = useAgentStream();  const { status, output, error, start, stop, resetSession } = useAgentStream();
+
+  const canConnect = useMemo(  const canConnect = useMemo(() => mode === "disconnected", [mode]);
+  const canSend = useMemo(
+    () => mode === "connected" && !!prompt.trim() && status !== "streaming",
+    [mode, prompt, status]
+  );
+
+  // 스트리밍이 끝나거나 에러가 나면 다음 명령을 입력할 수 있게 입력창을 비우고 포커스 유지  // NOTE:
+  // 백엔드는 session_id로 동일 local_agent.py 프로세스를 재사용합니다.
+  // 프론트는 Enter/보내기마다 새 SSE 연결은 열리지만(HTTP 요청은 새로 생김),
+  // 세션은 유지되므로 "처음 메시지"가 매번 초기화되지 않아야 합니다.
+
+  const onConnect = () => {  const onConnect = () => {
+    setMode("connected");
+  };
+
+  const onDisconnect = () => {
+    stop();
+    setMode("disconnected");
+    setPrompt("");
+  };
+
+  const onSend = () => {
+    const p = prompt.trim();
+    if (!p) return;
+    start(p);
+    // 전송 즉시 입력값 비우기(연속 명령 입력 가능)
+    setPrompt("");
+  };
+
+  return (
+    <div style={{ maxWidth: 900, margin: "0 auto", padding: 16 }}>
+      <h2>Jarvis Agent</h2>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <input
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder={
+            mode === "connected"
+              ? "명령을 입력하세요"
+              : "먼저 연결을 누른 뒤 명령을 입력하세요"
+          }
+          disabled={mode !== "connected"}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onSend();
+          }}
+          style={{ flex: 1, padding: 10 }}
+        />
+
+        <button
+          onClick={onConnect}
+          disabled={!canConnect}
+          style={{ padding: "10px 14px" }}
+        >
+          연결
+        </button>
+
+        <button
+          onClick={onSend}
+          disabled={!canSend}
+          style={{ padding: "10px 14px" }}
+        >
+          보내기
+        </button>
+
+        <button
+          onClick={stop}
+          disabled={status !== "streaming"}
+          style={{ padding: "10px 14px" }}
+        >
+          중지
+        </button>
+
+        <button
+          onClick={onDisconnect}
+          disabled={mode !== "connected"}
+          style={{ padding: "10px 14px" }}
+        >
+          연결해제
+        </button>
+      </div>
+
+      <div style={{ marginTop: 12, fontSize: 12, opacity: 0.8 }}>
+        상태: {mode} / {status}
+      </div>
+
+      {error && (
+        <div style={{ marginTop: 12, color: "crimson" }}>{error}</div>
+      )}
+
+      <pre
+        style={{
+          marginTop: 12,
+          padding: 12,
+          background: "#111",
+          color: "#eee",
+          minHeight: 240,
+          whiteSpace: "pre-wrap",
+          borderRadius: 8,
+        }}
+      >
+        {output || "(응답 대기 중)"}
+      </pre>
+    </div>
+  );
+}

@@ -1,0 +1,105 @@
+# agent/intent_guard.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
+
+READ_ONLY_ACTIONS = {
+    "set_project",
+    "list_dir",
+    "read_tail",
+    "run_cmd",
+    "index_project",  # 필요하면 read-only로 취급
+}
+
+# run_cmd 중에서도 "읽기"만 허용할 cmd_key
+READ_ONLY_CMD_KEYS = {
+    "pwd", "ls", "whoami", "date",
+    "docker_ps", "docker_logs_tail", "systemctl_status", "journalctl_tail",
+    "git_status", "git_diff", "git_diff_staged",
+}
+
+# “찾아줘/어느 파일/어디에 있음” 류는 read-only로 강제
+# 조회 전용: "찾아줘/어디에 있어" 등 (단, "코드/설정"은 "코드 넣어줘"와 겹치므로 제외)
+READ_INTENT_KEYWORDS = {
+    "어느 파일", "어떤 파일", "어디에 있어", "어디있", "어딨",
+    "찾아줘", "검색해줘", "grep", "find", "show", "where", "which file", "locate",
+}
+
+# 반대로 “수정/추가/변경”이면 write 의도 가능성이 높음
+WRITE_INTENT_KEYWORDS = {
+    # create_vite_app 오인 방지: 조회 의도(찾아줘/어디 등)에서만 readonly로 강제되도록,
+    # 실행/생성 의도 키워드를 명확히 포함
+    "vite", "vite app", "create_vite_app",
+
+    "수정", "바꿔", "변경", "추가", "삭제", "지워", "만들", "작성", "적어줘",
+    "넣어줘", "넣어", "추가해줘", "넣어서", "설정해줘", "허용해줘",
+    "열어서 수정", "찾아서 수정", "diff", "만들어줘", "추가해",
+    "렌더링", "연결해줘", "띄워줘", "보이게 해줘", "화면에",
+    "patch", "write", "append", "rename", "create", "update", "remove",
+    "커밋", "commit", "푸쉬", "push", "스테이지", "stage",
+}
+
+@dataclass(frozen=True)
+class GuardResult:
+    readonly: bool
+    reason: str
+
+
+def detect_readonly_intent(user_text: str) -> GuardResult:
+    """
+    아주 단순 휴리스틱:
+    - READ 키워드 있으면 readonly 강하게
+    - WRITE 키워드 있으면 readonly 아님
+    - 둘 다 없으면 readonly 아님(기본은 자유)
+    """
+    t = (user_text or "").strip().lower()
+    if not t:
+        return GuardResult(False, "empty")
+
+    has_read = any(k.lower() in t for k in READ_INTENT_KEYWORDS)
+    has_write = any(k.lower() in t for k in WRITE_INTENT_KEYWORDS)
+
+    if has_read and not has_write:
+        return GuardResult(True, "read-intent keywords matched")
+    return GuardResult(False, "no readonly enforcement")
+
+
+def filter_plan_to_readonly(actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    readonly 모드에서 허용되는 액션만 남긴다.
+    - write 계열: write_file/append_file/patch_file/rename_path/ mkdir 등 제거
+    - git write: run_cmd(git_add/commit/push) 제거
+    """
+    kept: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+
+    for step in actions or []:
+        act = step.get("action")
+        if act not in READ_ONLY_ACTIONS:
+            dropped.append(step)
+            continue
+
+        if act == "run_cmd":
+            params = step.get("params", {}) or {}
+            cmd_key = (params.get("cmd_key") or "").strip()
+            if cmd_key not in READ_ONLY_CMD_KEYS:
+                dropped.append(step)
+                continue
+
+        kept.append(step)
+
+    return kept, dropped
+
+
+def build_readonly_rewrite_request() -> str:
+    """
+    LLM에게 ‘검색 전용 plan’을 다시 내라고 강제할 때 쓰는 메시지.
+    """
+    return (
+        "방금 요청은 '조회/검색' 의도입니다.\n"
+        "절대 파일 수정(write_file/append_file/patch_file/rename_path/mkdir)이나 "
+        "git 쓰기(git_add/git_commit/git_push) 액션을 포함하지 마세요.\n"
+        "허용 액션: set_project, list_dir, read_tail, index_project, run_cmd(읽기 전용: git_status/git_diff/git_diff_staged/pwd/ls)\n"
+        "그 범위 안에서만 plan을 다시 JSON으로 출력하세요."
+    )

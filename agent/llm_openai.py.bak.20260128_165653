@@ -1,0 +1,50 @@
+# agent/llm_openai.py
+import os
+import json
+from pathlib import Path
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# ✅ jarvis 루트의 .env 강제 로드 (agent 폴더 기준 상위)
+ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=ENV_PATH, override=False)
+
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise RuntimeError(f"OPENAI_API_KEY not set. Put it in {ENV_PATH}")
+
+client = OpenAI(api_key=api_key)
+
+MODEL = "gpt-5.2"
+
+SYSTEM_GUARD = """
+You are an execution planner.
+You MUST output ONLY ONE valid JSON object.
+Never output text outside JSON.
+"""
+
+def chat_text(messages, temperature=0.2) -> str:
+    msgs = [{"role": "system", "content": SYSTEM_GUARD}] + (messages or [])
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=msgs,
+        temperature=temperature,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+def chat_json(messages, temperature=0):
+    msgs = [{"role": "system", "content": SYSTEM_GUARD}] + (messages or [])
+
+    for _ in range(3):
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=msgs,
+            temperature=temperature,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        try:
+            return json.loads(content)
+        except Exception:
+            msgs.append({"role": "system", "content": "REMINDER: Output ONLY JSON."})
+
+    raise RuntimeError("LLM failed to return valid JSON after 3 attempts")

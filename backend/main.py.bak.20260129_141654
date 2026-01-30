@@ -1,0 +1,100 @@
+import asyncio
+import os
+import sys
+from pathlib import Path
+from typing import AsyncGenerator, Optional
+
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import StreamingResponse
+
+app = FastAPI(title="Jarvis Agent Bridge")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_AGENT = PROJECT_ROOT / "local_agent.py"
+
+
+def _sse(event: str, data: str) -> bytes:
+    # SSE format: event + data lines + blank line
+    # data must be text; caller should JSON-encode if needed
+    return f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+
+
+async def _stream_process_stdout(proc: asyncio.subprocess.Process, request: Request) -> AsyncGenerator[bytes, None]:
+    # initial meta
+    yield _sse("meta", "{\"ok\":true}")
+
+    try:
+        assert proc.stdout is not None
+        while True:
+            if await request.is_disconnected():
+                break
+
+            line = await proc.stdout.readline()
+            if not line:
+                break
+
+            text = line.decode("utf-8", errors="replace").rstrip("\n")
+            # send each line as a chunk
+            # JSON string escape minimal: wrap as JSON object
+            safe = text.replace("\\", "\\\\").replace('"', '\\"')
+            yield _sse("chunk", f"{{\"text\":\"{safe}\"}}")
+
+        rc = await proc.wait()
+        yield _sse("done", f"{{\"ok\":true,\"code\":{rc}}}")
+
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                proc.kill()
+
+
+@app.get("/api/agent/stream")
+async def agent_stream(
+    request: Request,
+    prompt: str = Query("", description="User prompt to send to local_agent.py"),
+    workdir: Optional[str] = Query(None, description="Optional project workdir to set inside agent"),
+):
+    if not LOCAL_AGENT.exists():
+        return StreamingResponse(iter([_sse("error", "{\"ok\":false,\"error\":\"local_agent.py not found\"}")]), media_type="text/event-stream")
+
+    # We run local_agent.py as an interactive CLI and feed the prompt via stdin.
+    # It will print lines like "You>" prompts; we just stream stdout lines as-is.
+    py = sys.executable
+
+    env = os.environ.copy()
+    # Disable stdout buffering for SSE streaming
+    env["PYTHONUNBUFFERED"] = "1"
+
+    # ensure project root is importable
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + (os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
+
+    proc = await asyncio.create_subprocess_exec(
+        py,
+        str(LOCAL_AGENT),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+    )
+
+    # feed commands
+    assert proc.stdin is not None
+    if workdir:
+        proc.stdin.write(f"{workdir}\n".encode("utf-8"))
+        await proc.stdin.drain()
+    proc.stdin.write((prompt + "\n").encode("utf-8"))
+    await proc.stdin.drain()
+
+    return StreamingResponse(
+        _stream_process_stdout(proc, request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

@@ -1,0 +1,432 @@
+# local_agent.py
+import json
+import sys
+
+from agent.config import SAFE_ROOTS, GIT_WRITE_KEYS
+from agent.prompt import build_system_prompt
+from agent.plan import parse_json_object, normalize_to_plan, optimize_plan
+from agent.state import state_line, set_current_workdir, get_current_workdir
+from agent.project_resolver import resolve_project_dir
+
+from agent.tools_fs import (
+    list_dir, read_tail, mkdir, write_file, append_file, patch_file, rename_path
+)
+from agent.tools_cmd import run_whitelisted_cmd, resolve_git_cwd
+from agent.vite import create_vite_app as create_vite_app_impl
+from agent.fallback import maybe_fallback_for_patch
+from agent.lang_guard import is_language_ok, build_rewrite_request
+from agent.approval import apply_git_approval_layer, print_git_preview, prompt_yes_no
+
+# RAG
+from agent.rag import build_or_update_index, retrieve, format_hits_for_prompt
+
+# ✅ OpenAI
+from agent.llm_openai import chat_json, chat_text
+from agent.intent_guard import (
+    detect_readonly_intent,
+    filter_plan_to_readonly,
+    build_readonly_rewrite_request,
+)
+
+# Step D
+from agent.approval_fs import FS_WRITE_ACTIONS, approve_fs_action
+
+# Step E
+from agent.recovery import undo_last
+
+from dotenv import load_dotenv
+load_dotenv()
+
+
+def normalize_git_direct_actions(actions: list[dict]) -> list[dict]:
+    mapping = {
+        "git_status": ("git_status", []),
+        "git_diff": ("git_diff", []),
+        "git_diff_staged": ("git_diff_staged", []),
+        "git_add": ("git_add", None),
+        "git_commit": ("git_commit", None),
+        "git_push": ("git_push", None),
+    }
+
+    out = []
+    for step in actions:
+        act = step.get("action")
+        if act not in mapping:
+            out.append(step)
+            continue
+
+        cmd_key, fixed_args = mapping[act]
+        params = step.get("params", {}) or {}
+
+        if fixed_args is not None:
+            args = fixed_args[:]
+        else:
+            if act == "git_add":
+                path = params.get("path") or params.get("file") or "."
+                args = [str(path)]
+            elif act == "git_commit":
+                msg = params.get("message") or params.get("msg") or ""
+                args = [str(msg)] if msg.strip() else ["update"]
+            elif act == "git_push":
+                remote = params.get("remote")
+                branch = params.get("branch")
+                if remote and branch:
+                    args = [str(remote), str(branch)]
+                elif remote:
+                    args = [str(remote)]
+                else:
+                    args = []
+        out.append({"action": "run_cmd", "params": {"cmd_key": cmd_key, "args": args}})
+
+    return out
+
+
+# def ollama_chat(messages):
+#     payload = {
+#         "model": MODEL,
+#         "messages": messages,
+#         "stream": False,
+#         "options": {"temperature": 0.2},
+#     }
+#     r = requests.post(OLLAMA_URL, json=payload, timeout=120)
+#     r.raise_for_status()
+#     return r.json()["message"]["content"]
+
+
+def tool_set_project(workdir: str):
+    p, info = resolve_project_dir(workdir)
+    if p is None:
+        return {"error": "workdir not found or not a directory", **info}
+
+    set_current_workdir(p)
+
+    git_dir = p / ".git"
+    if not git_dir.exists():
+        return {"warning": "workdir has no .git directory (still set)", "current_workdir": str(p), **info}
+
+    return {"ok": True, "current_workdir": str(p), **info}
+
+
+def execute_one_action(action: str, params: dict):
+    if action == "set_project":
+        return tool_set_project(params.get("workdir", ""))
+
+    if action == "index_project":
+        wd = params.get("workdir") or get_current_workdir()
+        if not wd:
+            return {"error": "no current workdir. use set_project first"}
+        # build_or_update_index는 Path를 기대함
+        if isinstance(wd, str):
+            p, info = resolve_project_dir(wd)
+            if p is None or not p.is_dir():
+                return {"error": "workdir not found or not a directory", **(info or {})}
+            wd = p
+        return build_or_update_index(wd)
+
+    if action == "undo_last":
+        return undo_last()
+
+    if action == "list_dir":
+        return list_dir(params.get("path", "."))
+
+    if action == "read_tail":
+        return read_tail(params.get("path", ""), params.get("lines", 200))
+
+    if action == "mkdir":
+        return mkdir(params.get("path", ""), params.get("parents", True))
+
+    if action == "write_file":
+        return write_file(params.get("path", ""), params.get("content", ""), params.get("overwrite", True))
+
+    if action == "append_file":
+        return append_file(params.get("path", ""), params.get("content", ""))
+
+    if action == "patch_file":
+        return patch_file(
+            path=params.get("path", ""),
+            op=params.get("op", ""),
+            content=params.get("content", ""),
+            anchor=params.get("anchor"),
+            start_marker=params.get("start_marker"),
+            end_marker=params.get("end_marker"),
+            occurrence=params.get("occurrence", 1),
+        )
+
+    if action == "create_vite_app":
+        root = get_current_workdir()
+        if root is None:
+            return {"error": "no current workdir. run set_project first"}
+        return create_vite_app_impl(
+            project_root=root,
+            path=params.get("path", "frontend"),
+            template=params.get("template", "react"),
+            ask_yes_no=prompt_yes_no,
+        )
+
+    if action == "rename_path":
+        return rename_path(
+            src=params.get("src", ""),
+            dst=params.get("dst"),
+            new_name=params.get("new_name"),
+        )
+
+    if action == "run_cmd":
+        return run_whitelisted_cmd(params.get("cmd_key", ""), params.get("args", []))
+
+    return {"error": f"unknown action: {action}"}
+
+
+def main():
+    print("SAFE_ROOTS:")
+    for r in SAFE_ROOTS:
+        print(" -", r)
+
+    print("\nExamples:")
+    print(" - 'jarvis 프로젝트로 설정해줘'")
+    print(" - 'TASKS.md 맨 아래에 진행상태 5줄 추가해줘'")
+    print(" - '되돌리기 해줘' (undo_last)")
+    print(" - 'git status 보여줘'\n")
+
+    SYSTEM_PROMPT = build_system_prompt()
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # while True:
+    #     user = input("You> ").strip()
+    #     if not user:
+    #         continue
+
+    #     messages.append({"role": "system", "content": state_line()})
+
+    #     cwd = get_current_workdir()
+    #     if cwd:
+    #         try:
+    #             hits = retrieve(cwd, user, top_k=8)
+    #             ctx = format_hits_for_prompt(hits, cwd)
+    #             messages.append({
+    #                 "role": "user",
+    #                 "content": "아래는 현재 프로젝트 코드베이스에서 검색한 컨텍스트입니다. 이 근거를 사용해서만 판단하세요.\n\n" + ctx
+    #             })
+    #         except Exception as e:
+    #             messages.append({"role": "user", "content": f"(RAG 컨텍스트 주입 실패: {e})"})
+
+    #     messages.append({"role": "user", "content": user})
+    #     raw = ollama_chat(messages)
+
+    #     try:
+    #         cmd = parse_json_object(raw)
+    #     except Exception:
+    #         print("Agent> (LLM JSON parse failed)\n", raw, "\n")
+    #         continue
+
+    #     ok, _detail = is_language_ok(cmd, forbid_latin=False)
+    #     if not ok:
+    #         messages.append({"role": "user", "content": build_rewrite_request(forbid_latin=False)})
+    #         raw_retry = ollama_chat(messages)
+    #         try:
+    #             cmd = parse_json_object(raw_retry)
+    #         except Exception:
+    #             print("Agent> (LLM JSON parse failed after rewrite)\n", raw_retry, "\n")
+    #             continue
+
+    #     cmd = normalize_to_plan(cmd)
+    #     cmd = optimize_plan(cmd)
+    while True:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        user = input("You> ").strip()
+        if not user:
+            continue
+
+        # ✅ 1) 매 턴 최신 상태(system) 먼저 주입 (LLM이 CURRENT_WORKDIR 등을 보게)
+        messages.append({"role": "system", "content": state_line()})
+
+        # ✅ 2) RAG 컨텍스트: 사용자 요청을 맨 앞에 두고, 검색 결과는 참고용으로만 (요청을 압도하지 않도록)
+        cwd = get_current_workdir()
+        user_blob = f"사용자 요청 (반드시 이걸 수행하세요):\n{user}"
+        if cwd:
+            try:
+                hits = retrieve(cwd, user, top_k=6)
+                ctx = format_hits_for_prompt(hits, cwd)
+                if ctx and ctx.strip() != "NO_CONTEXT_FOUND":
+                    user_blob += "\n\n--- 참고용 코드 검색 결과 (요청과 관련될 때만 활용) ---\n" + ctx
+            except Exception:
+                pass
+        messages.append({"role": "user", "content": user_blob})
+
+        # ✅ 4) 여기서 LLM 호출 (딱 1번!)
+        try:
+            cmd = chat_json(messages)
+            # chat_json은 이미 딕셔너리를 반환하므로 parse_json_object 불필요
+            if not isinstance(cmd, dict):
+                print(f"Agent> (LLM returned non-dict: {type(cmd)})\n{cmd}\n")
+                continue
+        except RuntimeError as e:
+            print(f"Agent> (LLM failed to return JSON after retries)\n{str(e)}\n")
+            continue
+        except Exception as e:
+            print(f"Agent> (LLM call error: {type(e).__name__})\n{str(e)}\n")
+            continue
+
+        # ✅ 5) 언어 가드: 중국어(한자) 나오면 즉시 재요청 1회
+        ok, _detail = is_language_ok(cmd, forbid_latin=False)
+        if not ok:
+            messages.append({"role": "user", "content": build_rewrite_request(forbid_latin=False)})
+            try:
+                cmd = chat_json(messages)
+                if not isinstance(cmd, dict):
+                    print(f"Agent> (LLM returned non-dict after rewrite: {type(cmd)})\n{cmd}\n")
+                    continue
+            except RuntimeError as e:
+                print(f"Agent> (LLM failed after rewrite)\n{str(e)}\n")
+                continue
+            except Exception as e:
+                print(f"Agent> (LLM call error after rewrite: {type(e).__name__})\n{str(e)}\n")
+                continue
+
+        cmd = normalize_to_plan(cmd)
+        cmd = optimize_plan(cmd)
+
+        if cmd.get("action") == "final":
+            print(f"Agent> {cmd.get('final_answer','')}\n")
+            continue
+
+        if cmd.get("action") != "plan":
+            print("Agent> (invalid schema)\n", json.dumps(cmd, ensure_ascii=False, indent=2), "\n")
+            continue
+
+        actions = cmd.get("actions", [])
+
+        # =========================
+        # ✅ READ-ONLY GUARD (검색/질문이면 수정/커밋/푸시 금지)
+        # =========================
+        guard = detect_readonly_intent(user)
+
+        if guard.readonly:
+            kept, dropped = filter_plan_to_readonly(actions)
+
+            # 만약 LLM이 수정 계획을 내놔서 거의 다 날아갔다면 -> LLM에게 재작성 1회
+            if len(kept) == 0 and len(dropped) > 0:
+                messages.append({"role": "user", "content": build_readonly_rewrite_request()})
+                try:
+                    cmd_ro = chat_json(messages)
+                    if isinstance(cmd_ro, dict):
+                        cmd_ro = normalize_to_plan(cmd_ro)
+                        cmd_ro = optimize_plan(cmd_ro)
+                        actions = cmd_ro.get("actions", []) or []
+                        actions = normalize_git_direct_actions(actions)
+                        kept, dropped = filter_plan_to_readonly(actions)
+                except Exception:
+                    kept = []
+
+            if len(dropped) > 0:
+                print("\n[READ-ONLY GUARD] 이 요청은 조회/검색으로 판단되어, 아래 액션들을 차단했습니다:")
+                print(json.dumps(dropped, ensure_ascii=False, indent=2))
+
+            actions = kept
+
+        reason = cmd.get("reason", "")
+        if not isinstance(actions, list) or len(actions) == 0:
+            print("Agent> (plan has no actions)\n", json.dumps(cmd, ensure_ascii=False, indent=2), "\n")
+            continue
+
+        actions = normalize_git_direct_actions(actions)
+
+        print(f"\n[LLM plan] reason={reason} steps={len(actions)}")
+
+        # Step B: Git 승인 레이어
+        try:
+            _, actions = apply_git_approval_layer(actions)
+        except Exception as e:
+            print(f"Agent> (approval layer error) {e}")
+            safe_actions = []
+            for step in actions:
+                if step.get("action") == "run_cmd":
+                    params = step.get("params", {}) or {}
+                    if params.get("cmd_key") in {"git_add", "git_commit", "git_push"}:
+                        continue
+                safe_actions.append(step)
+            actions = safe_actions
+
+        print(f"\n[LLM plan after approval] steps={len(actions)}")
+
+        results = []
+        for i, step in enumerate(actions, start=1):
+            step_action = step.get("action")
+            step_params = step.get("params", {}) or {}
+
+            print(f"\n[Step {i}/{len(actions)}] action={step_action} params={step_params}")
+
+            # Step D: 파일 적용 승인
+            if step_action in FS_WRITE_ACTIONS:
+                ok_apply, preview_or_err = approve_fs_action(step_action, step_params)
+                if not ok_apply:
+                    result = {
+                        "skipped": True,
+                        "reason": "user denied file apply or preview failed",
+                        "detail": preview_or_err,
+                        "action": step_action,
+                    }
+                    print("[Tool result]\n", json.dumps(result, ensure_ascii=False, indent=2))
+                    results.append({"step": i, "action": step_action, "params": step_params, "result": result})
+                    continue
+
+            # Step B: git write 승인
+            if step_action == "run_cmd":
+                cmd_key = (step_params or {}).get("cmd_key", "")
+                if cmd_key in GIT_WRITE_KEYS:
+                    args = (step_params or {}).get("args", []) or []
+                    git_cwd, _, err = resolve_git_cwd(args)
+                    if err is None and git_cwd is not None:
+                        print("\n=== APPROVAL REQUIRED (git write) ===")
+                        preview = print_git_preview()
+                        st = (preview.get("git_status") or {}).get("output") or (preview.get("git_status") or {}).get("error") or ""
+                        df = (preview.get("git_diff") or {}).get("output") or (preview.get("git_diff") or {}).get("error") or ""
+                        dfs = (preview.get("git_diff_staged") or {}).get("output") or (preview.get("git_diff_staged") or {}).get("error") or ""
+                        has_any_change = st.strip() != "" or df.strip() != "" or dfs.strip() != ""
+                        if has_any_change and (not prompt_yes_no("이 변경을 계속 진행할까요? (y/n): ")):
+                            result = {"skipped": True, "reason": "user denied approval for git write", "cmd_key": cmd_key}
+                            print("[Tool result]\n", json.dumps(result, ensure_ascii=False, indent=2))
+                            results.append({"step": i, "action": step_action, "params": step_params, "result": result})
+                            continue
+
+            try:
+                result = execute_one_action(step_action, step_params)
+            except Exception as e:
+                result = {"error": "tool_exception", "detail": str(e)}
+
+            print("[Tool result]\n", json.dumps(result, ensure_ascii=False, indent=2))
+            results.append({"step": i, "action": step_action, "params": step_params, "result": result})
+
+            fb = maybe_fallback_for_patch(step_action, step_params, result, user_request=user)
+            if fb is not None:
+                print("\n[Fallback triggered]\n", json.dumps(fb, ensure_ascii=False, indent=2))
+                results[-1]["fallback"] = fb
+
+        messages.append({"role": "user", "content": f"TOOL_RESULTS (json): {json.dumps(results, ensure_ascii=False)}"})
+        messages.append({"role": "user", "content": (
+            "위 TOOL_RESULTS는 이번 턴에서만 실행된 결과입니다. 반드시 action='final' JSON으로만 답하세요. "
+            "plan을 만들지 말고, 이번 결과만 간단·자연스럽게 1~3문장으로 요약하세요. "
+            "형식(1)성공/실패 2)실패원인 3)다음액션)에 얽매이지 말고, 실패가 없으면 '완료했어 / 다음엔 ~ 해봐' 정도로 짧게."
+        )})
+
+        print("[Agent 응답 생성 중...]", flush=True)
+        raw2 = chat_text(messages)
+
+        try:
+            cmd2 = parse_json_object(raw2)
+            cmd2 = normalize_to_plan(cmd2)
+            if cmd2.get("action") == "final":
+                print(f"\nAgent> {cmd2.get('final_answer','')}\n")
+            elif cmd2.get("action") == "plan":
+                print("\nAgent> (non-final plan)\n", json.dumps(cmd2, ensure_ascii=False, indent=2), "\n")
+            else:
+                print("\nAgent> (LLM output)\n", raw2, "\n")
+        except Exception:
+            print("\nAgent> (LLM output)\n", raw2, "\n")
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+
+if __name__ == "__main__":
+    main()

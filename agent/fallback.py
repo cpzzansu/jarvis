@@ -1,7 +1,8 @@
 from __future__ import annotations
 import re
 
-from .config import FALLBACK_READ_LINES, MODEL
+from .config import FALLBACK_READ_LINES
+from .llm_state import get_provider, get_model
 from .paths import ensure_under_safe_roots, ensure_text_safe
 from .tools_fs import read_tail, write_file
 
@@ -60,7 +61,7 @@ def maybe_fallback_for_patch(step_action: str, step_params: dict, result: dict, 
     bullets = [
         "개발 목표: 기본 구조와 에이전트 워크플로우를 검증하는 테스트 프로젝트입니다.",
         "주요 기능: 파일 생성/수정 및 Git 상태 확인을 자동화합니다.",
-        f"사용 기술: Python 실행기 + 로컬 LLM(Ollama, model={MODEL}).",
+        f"사용 기술: Python 실행기 + LLM(provider={get_provider()}, model={get_model()}).",
         "사용 방법: set_project로 작업 폴더 고정 후 변경→diff 확인→commit/push 순서로 진행합니다.",
         "향후 계획: unified diff 기반 패치와 테스트/빌드 루프를 추가합니다.",
     ]

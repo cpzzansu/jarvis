@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import difflib
+import py_compile
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from .tools_fs import (
@@ -12,6 +15,27 @@ from .tools_fs import (
     preview_mkdir,
 )
 from .approval import prompt_yes_no
+
+
+def _validate_py_after_content(path_str: str, after_content: str) -> Tuple[bool, str]:
+    """Apply 전에 .py 파일의 after 내용을 py_compile로 검증. (성공, '') 또는 (실패, 에러메시지)."""
+    if not (path_str or "").strip().lower().endswith(".py"):
+        return True, ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(after_content)
+            tmp = f.name
+        try:
+            py_compile.compile(tmp, doraise=True)
+            return True, ""
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+    except py_compile.PyCompileError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
 
 
 # local_agent.py에서 체크할 "파일을 바꾸는 액션" 목록
@@ -107,6 +131,21 @@ def approve_fs_action(action: str, params: Dict[str, Any]) -> Tuple[bool, Dict[s
 
         if preview.get("error"):
             return False, preview
+
+        path = preview.get("path", "")
+        after = preview.get("after", "")
+        if path and after is not None and preview.get("kind") in ("write", "append", "patch"):
+            ok_compile, compile_err = _validate_py_after_content(path, after)
+            if not ok_compile:
+                _print_preview(preview)
+                print("\n--- py_compile 실패 (Apply 전 검증) ---")
+                print(compile_err)
+                return False, {
+                    "error": "py_compile_failed_preview",
+                    "detail": compile_err,
+                    "path": path,
+                    "action": action,
+                }
 
         _print_preview(preview)
 

@@ -1,7 +1,17 @@
 from pathlib import Path
+import os
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen2.5:7b-instruct"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "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").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "120"))
+
+def require_openai_key() -> None:
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OPENAI_API_KEY가 비어있습니다. jarvis/.env 또는 환경변수에 OPENAI_API_KEY를 설정하세요."
+        )
 
 SAFE_ROOTS = [
     Path("/Users/daallcntdevelop/workSpace"),
@@ -42,3 +52,5 @@ ALLOWED_CMDS = {
 
 GIT_KEYS = {"git_status", "git_diff", "git_diff_staged", "git_add", "git_commit", "git_push"}
 GIT_WRITE_KEYS = {"git_add", "git_commit", "git_push"}  # Step B approval required
+
+

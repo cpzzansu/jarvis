@@ -1,0 +1,118 @@
+import asyncio
+import os
+import sys
+from pathlib import Path
+from typing import AsyncGenerator, Optional
+
+from fastapi import FastAPI, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+app = FastAPI(title="Jarvis Agent Bridge")
+
+# CORS: allow frontend dev server (Vite default 5173)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_AGENT = PROJECT_ROOT / "local_agent.py"
+
+# 프로젝트 루트 venv의 Python으로 서브프로세스 실행 (local_agent.py 의존성 동일 환경)
+def _venv_python() -> Path:
+    if os.name == "nt":
+        candidate = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    else:
+        candidate = PROJECT_ROOT / ".venv" / "bin" / "python"
+    return candidate if candidate.exists() else Path(sys.executable)
+
+
+def _sse_data(data: str) -> bytes:
+    """EventSource onmessage는 event가 없거나 event: message 일 때만 호출됨. data만 보냄."""
+    return f"data: {data}\n\n".encode("utf-8")
+
+
+async def _stream_process_stdout(proc: asyncio.subprocess.Process, request: Request) -> AsyncGenerator[bytes, None]:
+    # NOTE: This function streams stdout until the process exits.
+    # For session-based mode we use a different streamer that reads until an end marker.
+
+    # initial meta (data만 보내서 프론트 onmessage가 받음)
+    yield _sse_data("{\"type\":\"meta\",\"ok\":true}")
+
+    try:
+        assert proc.stdout is not None
+        while True:
+            if await request.is_disconnected():
+                break
+
+            line = await proc.stdout.readline()
+            if not line:
+                break
+
+            text = line.decode("utf-8", errors="replace").rstrip("\n")
+            safe = text.replace("\\", "\\\\").replace('"', '\\"')
+            yield _sse_data(f"{{\"type\":\"chunk\",\"text\":\"{safe}\"}}")
+
+        rc = await proc.wait()
+        yield _sse_data(f"{{\"type\":\"done\",\"ok\":true,\"code\":{rc}}}")
+
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                proc.kill()
+
+
+@app.get("/api/agent/stream")
+async def agent_stream(
+    request: Request,
+    prompt: str = Query("", description="User prompt to send to local_agent.py"),
+    workdir: Optional[str] = Query(None, description="Optional project workdir to set inside agent"),
+):
+    if not LOCAL_AGENT.exists():
+        return StreamingResponse(iter([_sse_data("{\"type\":\"error\",\"ok\":false,\"error\":\"local_agent.py not found\"}")]), media_type="text/event-stream")
+
+    # 프로젝트 루트 venv의 Python으로 실행 (agent/ 등 동일 의존성)
+    py = str(_venv_python())
+
+    env = os.environ.copy()
+    # Disable stdout buffering for SSE streaming
+    env["PYTHONUNBUFFERED"] = "1"
+
+    # ensure project root is importable
+    env["PYTHONPATH"] = str(PROJECT_ROOT) + (os.pathsep + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
+
+    proc = await asyncio.create_subprocess_exec(
+        py,
+        "-u",
+        str(LOCAL_AGENT),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        cwd=str(PROJECT_ROOT),
+        env=env,
+    )
+
+    # feed commands
+    assert proc.stdin is not None
+    if workdir:
+        proc.stdin.write(f"{workdir}\n".encode("utf-8"))
+        await proc.stdin.drain()
+    proc.stdin.write((prompt + "\n").encode("utf-8"))
+    await proc.stdin.drain()
+
+    return StreamingResponse(
+        _stream_process_stdout(proc, request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
