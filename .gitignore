@@ -1,0 +1,15 @@
+# Local data (RAG indexes, recovery state — may contain API keys in Chroma DB)
+data/
+
+# Env and Python
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / OS
+.vscode/
+.DS_Store
+*.bak.*
+*.bak
