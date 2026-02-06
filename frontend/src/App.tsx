@@ -7,7 +7,9 @@ export default function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
 
   useEffect(() => {
-    meApi().then((r) => setAuthenticated(r != null));
+    meApi()
+      .then((r) => setAuthenticated(r != null))
+      .catch(() => setAuthenticated(false));
   }, []);
 
   async function handleLogout() {

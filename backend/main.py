@@ -63,7 +63,7 @@ class LoginBody(BaseModel):
 # CORS: allow frontend dev server (Vite default 5173)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://59.1.235.35"],    # allow remote access (IP)
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174", "http://59.1.235.35"],    # allow remote access (IP)
     # NOTE: 필요에 따라 포트/프로토콜을 조정하세요.
     # - Vite dev: http://59.1.235.35:5173
     # - plain http: http://59.1.235.35
